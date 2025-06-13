@@ -1,0 +1,195 @@
+# Imports
+import pandas as pd
+import numpy as np
+import torch
+import ast
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizerFast, BertForTokenClassification
+import torch.optim as optim
+
+# --- Global Configuration ---
+LABEL_LIST = ['O', 'B-FEATURE', 'I-FEATURE']
+LABEL_MAP = {label: i for i, label in enumerate(LABEL_LIST)}
+IGNORE_LABEL_ID = -100
+MODEL_NAME = "kamalkraj/Bio_ClinicalBERT"
+MAX_LEN = 512
+EPOCHS = 5
+LEARNING_RATE = 2e-5
+BATCH_SIZE = 24
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DATA_PATH = "nbme-score-clinical-patient-notes/"
+
+# --- Dataset Class ---
+class PatientNotesDataset(Dataset):
+    def __init__(self, encodings_list, labels_list):
+        self.encodings_list = encodings_list
+        self.labels_list = labels_list
+
+    def __getitem__(self, idx):
+        item = self.encodings_list[idx]
+        item['labels'] = self.labels_list[idx]
+        return item
+
+    def __len__(self):
+        return len(self.labels_list)
+
+# --- Preprocessing ---
+def preprocess_data(df, tokenizer, max_len):
+    all_input_ids, all_attention_masks, all_labels = [], [], []
+    all_offset_mappings, all_sequence_ids, all_contexts = [], [], []
+
+    for _, row in df.iterrows():
+        question, context = str(row['feature_text']), str(row['pn_history'])
+        location_str = str(row['location'])
+
+        encoding = tokenizer.encode_plus(
+            question, context, max_length=max_len, padding="max_length",
+            truncation="only_second", return_offsets_mapping=True, return_attention_mask=True
+        )
+
+        input_ids = encoding['input_ids']
+        attention_mask = encoding['attention_mask']
+        offset_mapping = encoding['offset_mapping']
+        sequence_ids = encoding.sequence_ids()
+
+        labels = [IGNORE_LABEL_ID] * len(input_ids)
+        for i in range(len(input_ids)):
+            if sequence_ids[i] == 1:
+                labels[i] = LABEL_MAP['O']
+
+        try:
+            spans = ast.literal_eval(location_str)
+        except:
+            spans = []
+
+        for span_str in spans:
+            try:
+                start_char, end_char = map(int, span_str.split())
+                if start_char >= end_char:
+                    continue
+                first = True
+                for i in range(len(input_ids)):
+                    if sequence_ids[i] != 1:
+                        continue
+                    start, end = offset_mapping[i]
+                    if max(start, start_char) < min(end, end_char):
+                        labels[i] = LABEL_MAP['B-FEATURE'] if first else LABEL_MAP['I-FEATURE']
+                        first = False
+            except:
+                continue
+
+        all_input_ids.append(torch.tensor(input_ids))
+        all_attention_masks.append(torch.tensor(attention_mask))
+        all_labels.append(torch.tensor(labels))
+        all_offset_mappings.append(offset_mapping)
+        all_sequence_ids.append(sequence_ids)
+        all_contexts.append(context)
+
+    inputs = [{'input_ids': x, 'attention_mask': y} for x, y in zip(all_input_ids, all_attention_masks)]
+    eval_info = {
+        'offset_mapping': all_offset_mappings,
+        'sequence_ids': all_sequence_ids,
+        'contexts': all_contexts,
+        'original_df': df.copy()
+    }
+    return inputs, all_labels, eval_info
+
+# --- Training Function ---
+def train_one_epoch(model, loader, optimizer):
+    model.train()
+    total_loss = 0
+    for batch in tqdm(loader, desc="Training"):
+        optimizer.zero_grad()
+        input_ids = batch['input_ids'].to(DEVICE)
+        attention_mask = batch['attention_mask'].to(DEVICE)
+        labels = batch['labels'].to(DEVICE)
+        outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+# --- Validation Function ---
+def validate_one_epoch(model, loader):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Validation"):
+            input_ids = batch['input_ids'].to(DEVICE)
+            attention_mask = batch['attention_mask'].to(DEVICE)
+            labels = batch['labels'].to(DEVICE)
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            total_loss += outputs.loss.item()
+    return total_loss / len(loader)
+
+# --- Plotting ---
+def plot_loss(train_losses, val_losses, model_name):
+    plt.figure()
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(f"Loss Curve - {model_name}")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"loss_curve_{model_name.replace('/', '_')}.png")
+    plt.show()
+
+# --- Main Execution ---
+def main():
+    print(f"Using device: {DEVICE}")
+
+    # Load data
+    try:
+        features_df = pd.read_csv(f"{DATA_PATH}features.csv")
+        notes_df = pd.read_csv(f"{DATA_PATH}patient_notes.csv")
+        train_df = pd.read_csv(f"{DATA_PATH}train.csv")
+    except FileNotFoundError as e:
+        print(f"File not found: {e}")
+        return
+
+    df = train_df.merge(features_df, on=['feature_num', 'case_num'], how='left')
+    df = df.merge(notes_df, on=['pn_num', 'case_num'], how='left')
+    df.dropna(subset=['pn_history', 'feature_text', 'location'], inplace=True)
+
+    train_val_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+    train_df, val_df = train_test_split(train_val_df, test_size=0.1, random_state=42)
+
+    print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+
+    tokenizer = BertTokenizerFast.from_pretrained(MODEL_NAME)
+    model = BertForTokenClassification.from_pretrained(MODEL_NAME, num_labels=len(LABEL_LIST))
+    model.to(DEVICE)
+
+    train_inputs, train_labels, _ = preprocess_data(train_df, tokenizer, MAX_LEN)
+    val_inputs, val_labels, _ = preprocess_data(val_df, tokenizer, MAX_LEN)
+
+    train_dataset = PatientNotesDataset(train_inputs, train_labels)
+    val_dataset = PatientNotesDataset(val_inputs, val_labels)
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+
+    train_losses = []
+    val_losses = []
+
+    for epoch in range(EPOCHS):
+        print(f"\nEpoch {epoch+1}/{EPOCHS}")
+        train_loss = train_one_epoch(model, train_loader, optimizer)
+        val_loss = validate_one_epoch(model, val_loader)
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        model.save_pretrained(f"checkpoints/epoch{epoch+1}")
+        tokenizer.save_pretrained(f"checkpoints/epoch{epoch+1}")
+        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+    plot_loss(train_losses, val_losses, MODEL_NAME)
+
+if __name__ == '__main__':
+    main()
