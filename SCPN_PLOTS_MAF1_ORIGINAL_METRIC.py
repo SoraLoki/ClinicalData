@@ -250,10 +250,51 @@ def extract_char_spans_from_token_labels(token_label_ids, offset_mapping, sequen
 
     return predicted_char_sets
 
+def calculate_f1_score_micro(true_labels_list, predicted_labels_list, sequence_ids_list, ignore_label_id):
+    """
+    Calculates the micro-averaged F1 score across all relevant tokens.
+    Only considers tokens from the context (sequence_id == 1) and actual labels (not IGNORE_LABEL_ID).
+    """
+    true_positives = 0
+    false_positives = 0
+    false_negatives = 0
+
+    for i in range(len(true_labels_list)):
+        true_labels_example = true_labels_list[i]
+        predicted_labels_example = predicted_labels_list[i]
+        sequence_ids_example = sequence_ids_list[i]
+
+        for token_idx in range(len(true_labels_example)):
+            if sequence_ids_example[token_idx] == 1 and true_labels_example[token_idx] != ignore_label_id:
+                true_label = true_labels_example[token_idx]
+                predicted_label = predicted_labels_example[token_idx]
+
+                # If the true label is a feature (B-FEATURE or I-FEATURE)
+                if true_label != LABEL_MAP['O']: # Actual feature
+                    if predicted_label == true_label: # Correctly predicted feature label
+                        true_positives += 1
+                    else: # Misclassified feature (as O or another feature type)
+                        false_negatives += 1
+                else: # If the true label is 'O' (non-feature)
+                    if predicted_label != LABEL_MAP['O']: # Predicted a feature when it's not one
+                        false_positives += 1
+                    # else: correctly predicted 'O', no change to TP, FP, FN
+
+    # Handle cases where TP + FP or TP + FN might be zero to avoid division by zero
+    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0.0
+    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0
+    
+    f1_score = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    return f1_score
+
 
 def calculate_jaccard_and_collect_errors(model, tokenizer, df_to_eval, device, max_len, label_map, id_to_label, description="Evaluating Jaccard"):
     model.eval()
     eval_results = [] 
+    
+    all_true_labels_for_f1 = []
+    all_predicted_labels_for_f1 = []
+    all_sequence_ids_for_f1 = []
 
     _, true_labels_tensor, eval_info = preprocess_data_for_token_classification(df_to_eval, tokenizer, max_len)
 
@@ -300,12 +341,22 @@ def calculate_jaccard_and_collect_errors(model, tokenizer, df_to_eval, device, m
             'sequence_ids': sequence_ids,
             'row_index': i 
         })
+        
+        # Collect labels for micro-averaged F1 score calculation
+        all_true_labels_for_f1.append(true_token_label_ids)
+        all_predicted_labels_for_f1.append(predicted_label_ids)
+        all_sequence_ids_for_f1.append(sequence_ids)
+
+    # Calculate micro-averaged F1 score
+    micro_f1_score = calculate_f1_score_micro(
+        all_true_labels_for_f1, all_predicted_labels_for_f1, all_sequence_ids_for_f1, IGNORE_LABEL_ID
+    )
 
     # Sort results by Jaccard score (ascending, so worst scores are first)
     eval_results.sort(key=lambda x: x['jaccard_score'])
 
     mean_jaccard = np.mean([res['jaccard_score'] for res in eval_results])
-    return mean_jaccard, eval_results
+    return mean_jaccard, micro_f1_score, eval_results
 
 # Plots (no changes needed)
 def save_performance_plot(history, model_friendly_name):
@@ -325,8 +376,10 @@ def save_performance_plot(history, model_friendly_name):
     ax1.grid(True)
 
     ax2 = ax1.twinx()
-    ax2.set_ylabel('Jaccard Score (higher is better)', color='green')
+    ax2.set_ylabel('Jaccard/F1 Score (higher is better)', color='green')
     ax2.plot(epochs_range, history['test_jaccard'], 's-', label='Test-Jaccard Score', color='green')
+    if 'test_f1' in history:
+        ax2.plot(epochs_range, history['test_f1'], 'd--', label='Test-Micro F1 Score', color='orange')
     ax2.tick_params(axis='y', labelcolor='green')
     ax2.legend(loc='upper right')
 
@@ -491,7 +544,7 @@ if __name__ == '__main__':
         # Train and evaluate model
         print(f"\n--- Training {friendly_name} for {EPOCHS} epochs ---")
 
-        training_history = {'train_loss': [], 'test_loss': [], 'test_jaccard': []}
+        training_history = {'train_loss': [], 'test_loss': [], 'test_jaccard': [], 'test_f1': []}
         all_eval_results_for_model = [] 
 
         for epoch in range(EPOCHS):
@@ -500,12 +553,13 @@ if __name__ == '__main__':
             training_history['test_loss'].append(avg_test_loss)
 
             
-            jaccard_score_epoch, current_eval_results = calculate_jaccard_and_collect_errors(
+            jaccard_score_epoch, f1_score_epoch, current_eval_results = calculate_jaccard_and_collect_errors(
                 current_model, current_tokenizer, test_data, device, MAX_LEN, LABEL_MAP, ID_TO_LABEL,
-                description=f"Epoch {epoch+1}/{EPOCHS} Jaccard Eval"
+                description=f"Epoch {epoch+1}/{EPOCHS} Jaccard/F1 Eval"
             )
-            print(f"Epoch {epoch+1} - Test Jaccard: {jaccard_score_epoch:.4f}")
+            print(f"Epoch {epoch+1} - Test Jaccard: {jaccard_score_epoch:.4f}, Test Micro F1: {f1_score_epoch:.4f}")
             training_history['test_jaccard'].append(jaccard_score_epoch)
+            training_history['test_f1'].append(f1_score_epoch)
 
             if epoch == EPOCHS - 1:
                 all_eval_results_for_model = current_eval_results
@@ -514,16 +568,23 @@ if __name__ == '__main__':
 
         best_jaccard_score = max(training_history['test_jaccard'])
         final_jaccard_score = training_history['test_jaccard'][-1]
+        best_f1_score = max(training_history['test_f1'])
+        final_f1_score = training_history['test_f1'][-1]
+
 
         print(f"\n--- Final results for {friendly_name} ---")
         print(f"Jaccard score in final epoch: {final_jaccard_score:.4f}")
         print(f"Best Jaccard score during training: {best_jaccard_score:.4f}")
+        print(f"Micro F1 score in final epoch: {final_f1_score:.4f}")
+        print(f"Best Micro F1 score during training: {best_f1_score:.4f}")
 
         final_results[friendly_name] = {
             'learning_rate_used': lr,
             'batch_size_used': batch_size,
             'final_test_jaccard': final_jaccard_score,
-            'best_test_jaccard_during_training': best_jaccard_score
+            'best_test_jaccard_during_training': best_jaccard_score,
+            'final_test_f1': final_f1_score,
+            'best_test_f1_during_training': best_f1_score
         }
 
         # Display worst performing examples and token-level errors 
@@ -539,4 +600,6 @@ if __name__ == '__main__':
         print(f"  - Batch Size: {result_data['batch_size_used']}")
         print(f"  - Best Test Jaccard during Training: {result_data['best_test_jaccard_during_training']:.4f}")
         print(f"  - Test Jaccard in Final Epoch: {result_data['final_test_jaccard']:.4f}")
+        print(f"  - Best Test Micro F1 during Training: {result_data['best_test_f1_during_training']:.4f}")
+        print(f"  - Test Micro F1 in Final Epoch: {result_data['final_test_f1']:.4f}")
         print("-" * 65)

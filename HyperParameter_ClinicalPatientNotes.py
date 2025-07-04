@@ -324,9 +324,9 @@ def hyperparameter_tuning_with_cv(df, model_name, param_grid, n_splits, max_len,
 if __name__ == '__main__':
    
     DATA_PATH = "nbme-score-clinical-patient-notes/"
-    MAX_LEN = 512
-    EPOCHS = 4          
-    N_SPLITS_CV = 2     
+    MAX_LEN = 350
+    EPOCHS = 7          
+    N_SPLITS_CV = 3     
     SAMPLE_N = 2000     
     
     # Setup
@@ -352,15 +352,17 @@ if __name__ == '__main__':
 
     # Defining model and hyperparameter 
     models_to_evaluate = {
-	#'BioFormer': 'bioformers/BioFormer-16L',
-    #'BERT-base-uncased': 'bert-base-uncased',
+	'BioFormer': 'bioformers/BioFormer-16L',
+    'BERT-base-uncased': 'bert-base-uncased',
 	'Roberta': 'FacebookAI/roberta-large',
+    'Clinical Bert': 'AKHIL001/Bio_Clinical_BERT',
+    'DeBerta': 'MoritzLaurer/deberta-v3-large-zeroshot-v2.0'
     }
     
     # Grid of hyperparameters 
     param_grid = {
-        'learning_rate': [1e-5, 3e-5, 5e-5],
-        'batch_size': [4]
+        'learning_rate': [1e-5, 3e-5, 5e-5,5e-5],
+        'batch_size': [1,2,4,8,16,24]
     }
 
     final_results = {}
